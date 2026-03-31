@@ -11,6 +11,7 @@ LLM 多场景资源分配与动态调度系统
 3. **优先级调度**：当资源紧张时，按场景优先级分配资源
 4. **请求排队**：资源满时，请求进入队列，按优先级+入队时间调度
 5. **动态负载**：充分利用不同场景峰值时间不同的特点，提高资源利用率
+6. **基于状态的智能调度**：v0.2 新增，整合 ResourceState、QueueState、RateLimitState 进行智能调度决策
 
 ## 核心特性
 
@@ -22,6 +23,9 @@ LLM 多场景资源分配与动态调度系统
 - ✅ 完整的 Prometheus 监控指标
 - ✅ 同步/异步请求支持
 - ✅ 可扩展的架构设计
+- ✅ **v0.2 新增**：基于状态的智能调度器 (SystemStateAnalyzer)
+- ✅ **v0.2 新增**：限流预检查，避免调度即将触限流的请求
+- ✅ **v0.2 新增**：可配置的调度策略
 
 ## 快速开始
 
@@ -38,6 +42,7 @@ from datetime import timedelta
 from src.models import SceneConfig, LLMRequest, GlobalConfig
 from src.scheduler import Scheduler, SchedulerConfig, MockLLMClient
 from src.token_estimator import SimpleEstimator
+from src.state_analyzer import SchedulingStrategyConfig
 
 global_config = GlobalConfig(
     total_concurrent_tokens=100000,
@@ -72,9 +77,18 @@ scheduler_config = SchedulerConfig(
     scene_configs=scene_configs,
 )
 
+# 可选：自定义调度策略配置
+strategy_config = SchedulingStrategyConfig(
+    low_load_threshold=0.4,      # 低负载阈值（默认 0.5）
+    medium_load_threshold=0.75,   # 中负载阈值（默认 0.8）
+    tpm_warning_threshold=0.85,    # TPM 告警阈值（默认 0.9）
+    qpm_warning_threshold=0.85,    # QPM 告警阈值（默认 0.9）
+)
+
 scheduler = Scheduler(
     config=scheduler_config,
     llm_client=MockLLMClient(delay=0.1),
+    scheduling_strategy_config=strategy_config,
 )
 
 scheduler.start()
@@ -87,6 +101,11 @@ req = LLMRequest(
 
 resp = scheduler.submit(req)
 print(resp.content)
+
+# 获取系统状态分析结果
+system_state = scheduler.get_last_system_state()
+print("Load level:", system_state.load_level)
+print("Bottleneck resource:", system_state.bottleneck_resource)
 
 scheduler.stop()
 ```
@@ -109,6 +128,7 @@ python examples/basic_usage.py
 | **QueueManager** | 队列管理器，管理各场景请求队列 |
 | **TokenEstimator** | Token 估算器 |
 | **MetricsCollector** | 监控指标采集器 |
+| **SystemStateAnalyzer** | v0.2 新增，系统状态分析器 |
 
 ### 目录结构
 
@@ -122,7 +142,8 @@ LLM-MultiScene-Scheduler/
 │   ├── rate_limiter.py   # 时间窗口限流器（TPM/QPM）
 │   ├── queue_manager.py  # 队列管理器
 │   ├── token_estimator.py # Token 估算器
-│   └── metrics.py        # Prometheus 监控指标
+│   ├── metrics.py        # Prometheus 监控指标
+│   └── state_analyzer.py # v0.2 新增，系统状态分析器
 ├── tests/
 │   ├── unit/
 │   ├── integration/
@@ -135,6 +156,8 @@ LLM-MultiScene-Scheduler/
 │   ├── spec.md
 │   ├── tasks.md
 │   └── checklist.md
+├── .trae/
+│   └── specs/          # v0.2 新增，规范文档
 ├── requirements.txt
 └── README.md
 ```
@@ -144,7 +167,7 @@ LLM-MultiScene-Scheduler/
 ### 资源分配策略
 
 1. **总需求 ≤ 总容量**：所有场景可以自由使用资源，不受场景 max_tokens 限制
-2. **总需求 &gt; 总容量**：
+2. **总需求 > 总容量**：
    - 按优先级分组，高优先级优先保障
    - 同时受场景 max_tokens 限制
 
@@ -153,6 +176,19 @@ LLM-MultiScene-Scheduler/
 调度优先级：
 1. 场景优先级（Priority，数字越小优先级越高）
 2. 入队时间（EnqueueTime，FIFO）
+
+### v0.2 新增：基于状态的智能调度
+
+系统会在调度前分析当前状态，包括：
+- **负载等级** (LoadLevel)：低/中/高负载
+- **瓶颈资源** (BottleneckResource)：并发 Token / TPM / QPM / 无
+- **场景健康度** (SceneHealth)：各场景队列积压、限流余量等
+
+智能调度特性：
+- 低负载时：激进调度，优先填满资源
+- 中负载时：平衡调度，兼顾优先级和公平性
+- 高负载时：保守调度，严格按优先级，保护高优先级场景
+- 限流预检查：避免调度即将触发限流的请求
 
 ## 监控指标
 
@@ -193,7 +229,7 @@ from src.scheduler import LLMClient
 from src.models import LLMResponse
 
 class MyLLMClient(LLMClient):
-    def call(self, prompt: str, max_output_token: int) -&gt; LLMResponse:
+    def call(self, prompt: str, max_output_token: int) -> LLMResponse:
         pass
 ```
 
@@ -205,9 +241,43 @@ class MyLLMClient(LLMClient):
 from src.token_estimator import TokenEstimator
 
 class MyEstimator(TokenEstimator):
-    def estimate(self, prompt: str, max_output_token: int) -&gt; int:
+    def estimate(self, prompt: str, max_output_token: int) -> int:
         pass
 ```
+
+### v0.2 新增：自定义调度策略
+
+使用 `SchedulingStrategyConfig` 自定义调度策略：
+
+```python
+from src.state_analyzer import SchedulingStrategyConfig
+
+strategy_config = SchedulingStrategyConfig(
+    low_load_threshold=0.4,      # 低负载阈值
+    medium_load_threshold=0.75,   # 中负载阈值
+    tpm_warning_threshold=0.85,    # TPM 告警阈值
+    qpm_warning_threshold=0.85,    # QPM 告警阈值
+)
+
+# 动态更新调度策略
+scheduler.update_scheduling_strategy_config(strategy_config)
+```
+
+## 版本历史
+
+### v0.2
+- 新增基于状态的智能调度器 (SystemStateAnalyzer)
+- 新增限流预检查功能
+- 优化资源分配策略
+- 优化队列调度流程
+- 新增规范文档 (.trae/specs/)
+
+### v0.1
+- 初始版本
+- 核心调度功能
+- 双层限流机制
+- 优先级调度
+- 完整监控指标
 
 ## 许可证
 
