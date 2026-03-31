@@ -97,7 +97,7 @@ class TestScheduler(unittest.TestCase):
 
         timeout = 2.0
         start = time.time()
-        while not result["done"] and time.time() - start &lt; timeout:
+        while not result["done"] and time.time() - start < timeout:
             time.sleep(0.05)
 
         self.assertTrue(result["done"])

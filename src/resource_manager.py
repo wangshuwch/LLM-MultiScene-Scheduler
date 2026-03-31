@@ -21,22 +21,35 @@ class ResourceManager:
         with self._lock:
             self._scene_max_tokens[scene_id] = max_tokens
 
-    def _calculate_total_demand(self) -> int:
-        return self._used_tokens
+    def _calculate_total_demand(self, queue_waiting_tokens: int = 0) -> int:
+        return self._used_tokens + queue_waiting_tokens
 
-    def try_acquire(self, scene_id: str, tokens: int) -> bool:
+    def _is_resource_abundant(self, queue_waiting_tokens: int = 0) -> bool:
+        total_demand = self._calculate_total_demand(queue_waiting_tokens)
+        return total_demand <= self._total_capacity
+
+    def _check_can_acquire(self, scene_id: str, tokens: int, queue_waiting_tokens: int = 0) -> bool:
+        available = self._total_capacity - self._used_tokens
+        if tokens > available:
+            return False
+
+        if not self._is_resource_abundant(queue_waiting_tokens):
+            if scene_id in self._scene_max_tokens:
+                max_tokens = self._scene_max_tokens[scene_id]
+                current_usage = self._scene_usage.get(scene_id, 0)
+                if current_usage + tokens > max_tokens:
+                    return False
+
+        return True
+
+    def can_acquire(self, scene_id: str, tokens: int, queue_waiting_tokens: int = 0) -> bool:
         with self._lock:
-            available = self._total_capacity - self._used_tokens
-            if tokens > available:
-                return False
+            return self._check_can_acquire(scene_id, tokens, queue_waiting_tokens)
 
-            total_demand = self._calculate_total_demand()
-            if total_demand + tokens > self._total_capacity:
-                if scene_id in self._scene_max_tokens:
-                    max_tokens = self._scene_max_tokens[scene_id]
-                    current_usage = self._scene_usage.get(scene_id, 0)
-                    if current_usage + tokens > max_tokens:
-                        return False
+    def try_acquire(self, scene_id: str, tokens: int, queue_waiting_tokens: int = 0) -> bool:
+        with self._lock:
+            if not self._check_can_acquire(scene_id, tokens, queue_waiting_tokens):
+                return False
 
             self._used_tokens += tokens
             self._scene_usage[scene_id] = self._scene_usage.get(scene_id, 0) + tokens

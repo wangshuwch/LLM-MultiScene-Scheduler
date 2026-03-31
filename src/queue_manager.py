@@ -1,6 +1,8 @@
 import threading
+from dataclasses import dataclass
 from collections import deque
 from datetime import datetime
+from typing import List, Tuple, Optional
 from .models import (
     LLMRequest,
     SceneConfig,
@@ -11,6 +13,14 @@ from .models import (
     QueueFullError,
     RequestTimeoutError,
 )
+
+
+@dataclass
+class QueueCandidate:
+    scene_id: str
+    request: LLMRequest
+    priority: int
+    enqueue_time: datetime
 
 
 class SceneQueue:
@@ -49,6 +59,38 @@ class QueueManager:
             sq.queue.append(req)
             sq.waiting_tokens += req.token_estimate
             self._stats.total_enqueued += 1
+
+    def get_candidates(self) -> List[QueueCandidate]:
+        with self._lock:
+            candidates = []
+            for scene_id, sq in self._scene_queues.items():
+                if not sq.queue:
+                    continue
+                cfg = self._scene_configs[scene_id]
+                front_req = sq.queue[0]
+                candidates.append(QueueCandidate(
+                    scene_id=scene_id,
+                    request=front_req,
+                    priority=cfg.priority,
+                    enqueue_time=front_req.enqueue_time
+                ))
+            return candidates
+
+    def select_best_candidate(self, candidates: List[QueueCandidate]) -> Optional[QueueCandidate]:
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: (c.priority, c.enqueue_time))
+        return candidates[0]
+
+    def dequeue_by_scene(self, scene_id: str) -> Optional[LLMRequest]:
+        with self._lock:
+            sq = self._scene_queues.get(scene_id)
+            if not sq or not sq.queue:
+                return None
+            req = sq.queue.popleft()
+            sq.waiting_tokens -= req.token_estimate
+            self._stats.total_dequeued += 1
+            return req
 
     def dequeue(self):
         with self._lock:
@@ -89,6 +131,10 @@ class QueueManager:
     def total_queue_length(self):
         with self._lock:
             return sum(len(sq.queue) for sq in self._scene_queues.values())
+
+    def get_total_waiting_tokens(self) -> int:
+        with self._lock:
+            return sum(sq.waiting_tokens for sq in self._scene_queues.values())
 
     def cleanup_expired(self):
         with self._lock:

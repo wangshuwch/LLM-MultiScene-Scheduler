@@ -1,17 +1,12 @@
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from typing import Optional, List
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 from .models import (
-    LLMRequest,
     LLMResponse,
-    SceneConfig,
-    GlobalConfig,
-    ResourceState,
-    QueueState,
-    RateLimitState,
     SceneNotFoundError,
     SceneDisabledError,
     SchedulerStoppedError,
@@ -21,8 +16,13 @@ from .models import (
 from .resource_manager import ResourceManager
 from .rate_limiter import SlidingWindowRateLimiter
 from .queue_manager import QueueManager
-from .token_estimator import TokenEstimator, SimpleEstimator
+from .token_estimator import SimpleEstimator
 from .metrics import MetricsCollector
+from .state_analyzer import (
+    SystemStateAnalyzer,
+    SchedulingStrategyConfig,
+    SystemState,
+)
 
 
 class LLMClient:
@@ -64,6 +64,7 @@ class Scheduler:
         llm_client=None,
         token_estimator=None,
         metrics_collector=None,
+        scheduling_strategy_config=None,
     ):
         self._config = config
         self._llm_client = llm_client or MockLLMClient()
@@ -78,6 +79,8 @@ class Scheduler:
             window_step_seconds=config.global_config.window_step_seconds,
         )
         self._queue_manager = QueueManager(config.scene_configs)
+        self._state_analyzer = SystemStateAnalyzer(scheduling_strategy_config)
+        self._last_system_state: Optional[SystemState] = None
 
         self._scene_configs = {}
         for cfg in config.scene_configs:
@@ -203,33 +206,61 @@ class Scheduler:
             self._resource_manager.set_scene_config(config)
             self._rate_limiter.set_scene_config(config)
 
+    def update_scheduling_strategy_config(self, config: SchedulingStrategyConfig) -> None:
+        with self._lock:
+            self._state_analyzer.update_config(config)
+
+    def get_last_system_state(self) -> Optional[SystemState]:
+        with self._lock:
+            return self._last_system_state
+
     def _dispatch_loop(self):
         while not self._stop_event.is_set():
             self._try_dispatch()
             time.sleep(self._config.dispatch_interval)
 
     def _try_dispatch(self):
-        req = self._queue_manager.dequeue()
-        if req is None:
+        candidates = self._queue_manager.get_candidates()
+        if not candidates:
             return
 
-        if datetime.now() > req.deadline:
-            self._metrics.inc_requests_timeout(req.scene_id)
-            if req.callback:
-                req.callback(None, RequestTimeoutError())
-            return
+        resource_state = self._resource_manager.get_state()
+        queue_states = self._queue_manager.get_queue_states()
+        rate_limit_state = self._rate_limiter.get_rate_limit_state()
 
-        if not self._resource_manager.try_acquire(req.scene_id, req.token_estimate):
-            try:
-                self._queue_manager.enqueue(req.scene_id, req)
-            except Exception as e:
-                self._metrics.inc_requests_failed(req.scene_id)
-                if req.callback:
-                    req.callback(None, e)
-            return
+        system_state = self._state_analyzer.analyze(
+            resource_state=resource_state,
+            queue_states=queue_states,
+            rate_limit_state=rate_limit_state,
+            scene_configs=self._scene_configs,
+            global_tpm_limit=self._config.global_config.global_tpm,
+            global_qpm_limit=self._config.global_config.global_qpm,
+        )
+        self._last_system_state = system_state
 
-        if self._executor:
-            self._executor.submit(self._execute_request, req)
+        candidates.sort(key=lambda c: (c.priority, c.enqueue_time))
+        total_waiting_tokens = self._queue_manager.get_total_waiting_tokens()
+
+        for candidate in candidates:
+            if datetime.now() > candidate.request.deadline:
+                req = self._queue_manager.dequeue_by_scene(candidate.scene_id)
+                if req:
+                    self._metrics.inc_requests_timeout(req.scene_id)
+                    if req.callback:
+                        req.callback(None, RequestTimeoutError())
+                continue
+
+            scene_health = system_state.scene_healths.get(candidate.scene_id)
+            if scene_health:
+                if self._state_analyzer.is_scene_rate_limited_soon(scene_health, candidate.request.token_estimate):
+                    continue
+
+            if self._resource_manager.can_acquire(candidate.scene_id, candidate.request.token_estimate, total_waiting_tokens):
+                req = self._queue_manager.dequeue_by_scene(candidate.scene_id)
+                if req and self._resource_manager.try_acquire(req.scene_id, req.token_estimate, total_waiting_tokens):
+                    if self._executor:
+                        self._executor.submit(self._execute_request, req)
+                    return
 
     def _execute_request(self, req):
         start_time = datetime.now()
