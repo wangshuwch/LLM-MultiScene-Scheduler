@@ -1,0 +1,41 @@
+global:
+  total_concurrent_tokens: 100000
+  global_tpm: 1000000
+  global_qpm: 10000
+  window_size_seconds: 60
+  window_step_seconds: 1
+  worker_count: 10
+
+scenes:
+  - scene_id: chatbot
+    name: Customer Chatbot
+    priority: 1
+    max_concurrent_tokens: 60000
+    weight: 0.5
+    scene_tpm: 500000
+    scene_qpm: 5000
+    is_enabled: true
+    queue_size: 1000
+    timeout_seconds: 120
+
+  - scene_id: analytics
+    name: Data Analytics
+    priority: 2
+    max_concurrent_tokens: 50000
+    weight: 0.3
+    scene_tpm: 300000
+    scene_qpm: 3000
+    is_enabled: true
+    queue_size: 500
+    timeout_seconds: 300
+
+  - scene_id: background
+    name: Background Jobs
+    priority: 3
+    max_concurrent_tokens: 40000
+    weight: 0.2
+    scene_tpm: 200000
+    scene_qpm: 2000
+    is_enabled: true
+    queue_size: 200
+    timeout_seconds: 600
