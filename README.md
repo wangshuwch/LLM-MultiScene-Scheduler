@@ -35,6 +35,14 @@ LLM 多场景资源分配与动态调度系统
 pip install -r requirements.txt
 ```
 
+依赖包括：
+- prometheus-client - 监控指标
+- tiktoken - Token 估算（可选）
+- pyyaml - 配置管理
+- matplotlib - 可视化（v0.2 新增）
+- seaborn - 可视化（v0.2 新增）
+- numpy - 数值计算（v0.2 新增）
+
 ### 基本使用
 
 ```python
@@ -116,6 +124,26 @@ scheduler.stop()
 python examples/basic_usage.py
 ```
 
+### v0.2 新增：运行模拟测试
+
+项目包含完整的模拟测试系统，用于验证调度器在不同负载条件下的性能表现：
+
+```bash
+# 验证组件
+python tests/simulation/verify_components.py
+
+# 快速测试
+python tests/simulation/quick_test.py
+
+# 运行单个场景
+python tests/simulation/main.py single scenario_c -t 100
+
+# 运行所有场景
+python tests/simulation/main.py all -t 100
+```
+
+详细说明请参考 [tests/simulation/README.md](tests/simulation/README.md)
+
 ## 架构设计
 
 ### 核心组件
@@ -146,8 +174,19 @@ LLM-MultiScene-Scheduler/
 │   └── state_analyzer.py # v0.2 新增，系统状态分析器
 ├── tests/
 │   ├── unit/
-│   ├── integration/
-│   └── load/
+│   │   ├── test_scheduler.py              # 基础单元测试
+│   │   └── test_scheduler_comprehensive.py # v0.2 新增，完整测试用例
+│   └── simulation/               # v0.2 新增，模拟测试系统
+│       ├── README.md
+│       ├── resource_pool.py     # 模拟 LLM 服务资源池
+│       ├── load_generator.py    # 多场景负载生成器
+│       ├── scenarios.py         # 测试场景定义
+│       ├── monitoring.py        # 监控和评估模块
+│       ├── visualization.py     # 可视化报告生成器
+│       ├── orchestrator.py      # 主模拟协调器
+│       ├── main.py              # 命令行入口
+│       ├── example_usage.py      # 使用示例
+│       └── verify_components.py  # 组件验证脚本
 ├── examples/
 │   └── basic_usage.py
 ├── configs/
@@ -156,8 +195,6 @@ LLM-MultiScene-Scheduler/
 │   ├── spec.md
 │   ├── tasks.md
 │   └── checklist.md
-├── .trae/
-│   └── specs/          # v0.2 新增，规范文档
 ├── requirements.txt
 └── README.md
 ```
@@ -218,6 +255,48 @@ LLM-MultiScene-Scheduler/
 
 参考 [configs/scheduler.yaml](configs/scheduler.yaml)
 
+## 测试
+
+### 单元测试
+
+```bash
+# 运行基础单元测试
+python -m pytest tests/unit/test_scheduler.py -v
+
+# 运行完整测试用例
+python -m pytest tests/unit/test_scheduler_comprehensive.py -v
+```
+
+### 模拟测试
+
+项目包含完整的模拟测试系统，用于验证调度器在不同负载条件下的性能表现。
+
+**4 个预定义测试场景**：
+- Scenario A - Daytime Peak (9:00-18:00)：日间峰值，正弦波流量模式
+- Scenario B - Nighttime Peak (23:00-02:00)：夜间峰值，指数增长流量模式
+- Scenario C - Extreme Burst：极端突发，测试系统弹性
+- Scenario D - Mixed Requests：混合请求，长尾 + 小请求混合
+
+**运行测试**：
+```bash
+# 验证组件
+python tests/simulation/verify_components.py
+
+# 快速测试
+python tests/simulation/quick_test.py
+
+# 列出所有可用场景
+python tests/simulation/main.py list
+
+# 运行单个场景（使用 100x 时间加速）
+python tests/simulation/main.py single scenario_c -t 100
+
+# 运行所有场景
+python tests/simulation/main.py all -t 100
+```
+
+详细说明请参考 [tests/simulation/README.md](tests/simulation/README.md)
+
 ## 扩展能力
 
 ### 自定义 LLM Client
@@ -270,7 +349,16 @@ scheduler.update_scheduling_strategy_config(strategy_config)
 - 新增限流预检查功能
 - 优化资源分配策略
 - 优化队列调度流程
-- 新增规范文档 (.trae/specs/)
+- **新增完整模拟测试系统** (tests/simulation/)
+  - 模拟 LLM 服务资源池
+  - 多场景负载生成器（多种流量模式和 token 分布）
+  - 4 个预定义测试场景
+  - 完整监控和评估模块
+  - 可视化报告生成器（matplotlib/seaborn）
+  - HTML 综合报告
+  - 命令行接口
+- **新增完整测试用例** (tests/unit/test_scheduler_comprehensive.py)
+- **新增可视化依赖** (matplotlib, seaborn, numpy)
 
 ### v0.1
 - 初始版本
