@@ -31,10 +31,12 @@ class SceneQueue:
 
 
 class QueueManager:
-    def __init__(self, scene_configs):
+    def __init__(self, scene_configs, global_queue_size: int = 10000):
         self._lock = threading.RLock()
         self._scene_queues = {}
         self._scene_configs = {}
+        self._global_queue_size = global_queue_size
+        self._active_request_ids = set()
         self._stats = QueueStats()
 
         for cfg in scene_configs:
@@ -50,30 +52,42 @@ class QueueManager:
             if not cfg or not cfg.is_enabled:
                 raise SceneDisabledError("Scene " + scene_id + " is disabled")
 
+            if req.request_id in self._active_request_ids:
+                self._stats.total_rejected += 1
+                raise QueueFullError("Request " + req.request_id + " is already in queue")
+
             sq = self._scene_queues[scene_id]
             if len(sq.queue) >= sq.max_size:
                 self._stats.total_rejected += 1
                 raise QueueFullError("Queue for scene " + scene_id + " is full")
 
+            total_queue_length = sum(len(sq.queue) for sq in self._scene_queues.values())
+            if total_queue_length >= self._global_queue_size:
+                self._stats.total_rejected += 1
+                raise QueueFullError("Global queue is full")
+
             req.enqueue_time = datetime.now()
             sq.queue.append(req)
             sq.waiting_tokens += req.token_estimate
+            self._active_request_ids.add(req.request_id)
             self._stats.total_enqueued += 1
 
-    def get_candidates(self) -> List[QueueCandidate]:
+    def get_candidates(self, max_per_scene: int = 5) -> List[QueueCandidate]:
         with self._lock:
             candidates = []
             for scene_id, sq in self._scene_queues.items():
                 if not sq.queue:
                     continue
                 cfg = self._scene_configs[scene_id]
-                front_req = sq.queue[0]
-                candidates.append(QueueCandidate(
-                    scene_id=scene_id,
-                    request=front_req,
-                    priority=cfg.priority,
-                    enqueue_time=front_req.enqueue_time
-                ))
+                for i, req in enumerate(sq.queue):
+                    if i >= max_per_scene:
+                        break
+                    candidates.append(QueueCandidate(
+                        scene_id=scene_id,
+                        request=req,
+                        priority=cfg.priority,
+                        enqueue_time=req.enqueue_time
+                    ))
             return candidates
 
     def select_best_candidate(self, candidates: List[QueueCandidate]) -> Optional[QueueCandidate]:
@@ -89,8 +103,23 @@ class QueueManager:
                 return None
             req = sq.queue.popleft()
             sq.waiting_tokens -= req.token_estimate
+            self._active_request_ids.discard(req.request_id)
             self._stats.total_dequeued += 1
             return req
+
+    def dequeue_specific_request(self, scene_id: str, request_id: str) -> Optional[LLMRequest]:
+        with self._lock:
+            sq = self._scene_queues.get(scene_id)
+            if not sq or not sq.queue:
+                return None
+            for i, req in enumerate(sq.queue):
+                if req.request_id == request_id:
+                    del sq.queue[i]
+                    sq.waiting_tokens -= req.token_estimate
+                    self._active_request_ids.discard(req.request_id)
+                    self._stats.total_dequeued += 1
+                    return req
+            return None
 
     def dequeue(self):
         with self._lock:
@@ -149,6 +178,7 @@ class QueueManager:
                     if now > req.deadline:
                         self._stats.total_timed_out += 1
                         cleaned += 1
+                        self._active_request_ids.discard(req.request_id)
                         if req.callback:
                             req.callback(None, RequestTimeoutError())
                     else:

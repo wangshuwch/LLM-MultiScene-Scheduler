@@ -23,6 +23,7 @@ class GlobalConfig:
     window_size_seconds: int = 60
     window_step_seconds: int = 1
     worker_count: int = 10
+    max_concurrent_requests: int = 100
 
 
 @dataclass
@@ -37,6 +38,7 @@ class SceneConfig:
     is_enabled: bool = True
     queue_size: int = 1000
     timeout: timedelta = field(default_factory=lambda: timedelta(minutes=5))
+    max_concurrent_requests: int = 50
 
 
 @dataclass
@@ -75,7 +77,10 @@ class ResourceState:
     total_concurrent_tokens: int
     used_concurrent_tokens: int = 0
     available_concurrent_tokens: int = 0
+    max_concurrent_requests: int = 0
+    used_concurrent_requests: int = 0
     scene_concurrent_usage: Dict[str, int] = field(default_factory=dict)
+    scene_concurrent_requests: Dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self):
         self.available_concurrent_tokens = self.total_concurrent_tokens - self.used_concurrent_tokens

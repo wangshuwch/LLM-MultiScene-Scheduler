@@ -50,11 +50,13 @@ class SchedulerConfig:
         scene_configs,
         cleanup_interval=30.0,
         dispatch_interval=0.01,
+        global_queue_size=10000,
     ):
         self.global_config = global_config
         self.scene_configs = scene_configs
         self.cleanup_interval = cleanup_interval
         self.dispatch_interval = dispatch_interval
+        self.global_queue_size = global_queue_size
 
 
 class Scheduler:
@@ -71,14 +73,17 @@ class Scheduler:
         self._token_estimator = token_estimator or SimpleEstimator()
         self._metrics = metrics_collector or MetricsCollector()
 
-        self._resource_manager = ResourceManager(config.global_config.total_concurrent_tokens)
+        self._resource_manager = ResourceManager(
+            total_capacity=config.global_config.total_concurrent_tokens,
+            max_concurrent_requests=config.global_config.max_concurrent_requests
+        )
         self._rate_limiter = SlidingWindowRateLimiter(
             global_tpm=config.global_config.global_tpm,
             global_qpm=config.global_config.global_qpm,
             window_size_seconds=config.global_config.window_size_seconds,
             window_step_seconds=config.global_config.window_step_seconds,
         )
-        self._queue_manager = QueueManager(config.scene_configs)
+        self._queue_manager = QueueManager(config.scene_configs, global_queue_size=config.global_queue_size)
         self._state_analyzer = SystemStateAnalyzer(scheduling_strategy_config)
         self._last_system_state: Optional[SystemState] = None
 
@@ -87,6 +92,8 @@ class Scheduler:
             self._scene_configs[cfg.scene_id] = cfg
             self._resource_manager.set_scene_config(cfg)
             self._rate_limiter.set_scene_config(cfg)
+
+        self._dispatch_event = threading.Event()
 
         self._metrics.set_total_concurrent_tokens(config.global_config.total_concurrent_tokens)
 
@@ -217,10 +224,11 @@ class Scheduler:
     def _dispatch_loop(self):
         while not self._stop_event.is_set():
             self._try_dispatch()
-            time.sleep(self._config.dispatch_interval)
+            self._dispatch_event.wait(timeout=self._config.dispatch_interval)
+            self._dispatch_event.clear()
 
     def _try_dispatch(self):
-        candidates = self._queue_manager.get_candidates()
+        candidates = self._queue_manager.get_candidates(max_per_scene=10)
         if not candidates:
             return
 
@@ -238,12 +246,21 @@ class Scheduler:
         )
         self._last_system_state = system_state
 
-        candidates.sort(key=lambda c: (c.priority, c.enqueue_time))
+        def calculate_effective_priority(candidate):
+            wait_seconds = (datetime.now() - candidate.enqueue_time).total_seconds()
+            aging_bonus = wait_seconds // 30
+            return (candidate.priority - aging_bonus, candidate.enqueue_time)
+
+        candidates.sort(key=calculate_effective_priority)
         total_waiting_tokens = self._queue_manager.get_total_waiting_tokens()
 
+        dispatched = set()
         for candidate in candidates:
+            if candidate.request.request_id in dispatched:
+                continue
+
             if datetime.now() > candidate.request.deadline:
-                req = self._queue_manager.dequeue_by_scene(candidate.scene_id)
+                req = self._queue_manager.dequeue_specific_request(candidate.scene_id, candidate.request.request_id)
                 if req:
                     self._metrics.inc_requests_timeout(req.scene_id)
                     if req.callback:
@@ -255,11 +272,15 @@ class Scheduler:
                 if self._state_analyzer.is_scene_rate_limited_soon(scene_health, candidate.request.token_estimate):
                     continue
 
+            if not self._rate_limiter.try_acquire(candidate.scene_id, candidate.request.token_estimate):
+                continue
+
             if self._resource_manager.can_acquire(candidate.scene_id, candidate.request.token_estimate, total_waiting_tokens):
-                req = self._queue_manager.dequeue_by_scene(candidate.scene_id)
+                req = self._queue_manager.dequeue_specific_request(candidate.scene_id, candidate.request.request_id)
                 if req and self._resource_manager.try_acquire(req.scene_id, req.token_estimate, total_waiting_tokens):
                     if self._executor:
                         self._executor.submit(self._execute_request, req)
+                    dispatched.add(req.request_id)
                     return
 
     def _execute_request(self, req):
@@ -283,6 +304,7 @@ class Scheduler:
                 req.callback(None, e)
         finally:
             self._resource_manager.release(req.scene_id, req.token_estimate)
+            self._dispatch_event.set()
 
     def _cleanup_loop(self):
         while not self._stop_event.is_set():
